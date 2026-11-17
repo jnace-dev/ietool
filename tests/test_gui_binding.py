@@ -1,11 +1,11 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """GUI 联动自测：界面参数变化时，预览与单选框是否同步（不真正进入事件循环）。"""
 import os
 import sys
 import tkinter as tk
 import tkinter.ttk as ttk
 
-sys.path.insert(0, r"D:\ai\ie")
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import ie_launcher as L
 
 ok = True

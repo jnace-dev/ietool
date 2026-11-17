@@ -9,7 +9,7 @@ import shutil
 import sys
 import tempfile
 
-sys.path.insert(0, r"D:\ai\ie")
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import ie_launcher as L
 
 ok = True

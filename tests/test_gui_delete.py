@@ -12,7 +12,7 @@ import tkinter as tk
 import tkinter.ttk as ttk
 from tkinter import messagebox
 
-sys.path.insert(0, r"D:\ai\ie")
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import ie_launcher as L
 
 ok = True

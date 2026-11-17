@@ -1168,12 +1168,445 @@ def detect_all():
 
 
 # --------------------------------------------------------------------------------------
+# DPI 缩放适配
+# --------------------------------------------------------------------------------------
+#
+# 不做适配时的两个毛病：
+#   1) 进程默认是 DPI-unaware，Windows 会把整张窗口按位图拉伸，
+#      125% / 150% 下文字发虚、边缘发糊；
+#   2) 界面按 96 DPI 排版再被系统整体放大，窗口高度容易超出工作区，
+#      小屏上底部直接看不见（原来记在“已知限制”里）。
+#
+# 这里做三件事：
+#   1) 在建任何窗口之前把进程声明成 DPI 感知（优先 Per-Monitor V2）；
+#   2) 按显示器真实 DPI 设置 Tk 的缩放系数，界面里所有以像素为单位的外边距 /
+#      内边距按同一系数换算；
+#   3) 窗口放不下时先压缩文本行数（字号不变），再整体缩小，保证完整落在工作区内。
+#
+# 注意：Tk 的 `tk scaling` 只在**新建字体**时才把“磅”换算成像素，
+# 运行中改它不会重排已有控件——所以运行中缩放必须自己重设字号（见 DpiLayout.apply_fonts）。
+
+DPI_AWARENESS_PER_MONITOR_V2 = -4
+
+BASE_DPI = 96.0          # 界面按 96 DPI 设计，所有像素量都以它为基准
+MIN_FACTOR = 0.62        # 自动缩放的下限（相对 96 DPI 基准，太小就没法看了）
+MIN_FONT_PX = 8          # 缩到最小也不能小于这个像素高度，否则看不清
+DEFAULT_FONT_PX = (10, 16)   # 96 DPI 下系统默认字体的合理像素范围
+
+_DPI_STATE = {"mode": ""}
+
+
+def enable_dpi_awareness():
+    """把当前进程声明为 DPI 感知——**必须在创建任何窗口之前调用**。
+
+    依次尝试 Per-Monitor V2 → Per-Monitor → System；
+    已经被 exe 清单声明过时 API 会返回 ERROR_ACCESS_DENIED，那也算已生效。
+    返回实际生效的模式说明。
+    """
+    if _DPI_STATE["mode"]:
+        return _DPI_STATE["mode"]
+
+    mode = "未启用（窗口由系统按位图拉伸，文字会发虚）"
+    done = False
+    if os.name == "nt":
+        try:
+            import ctypes
+
+            user32 = ctypes.windll.user32
+            kernel32 = ctypes.windll.kernel32
+
+            if hasattr(user32, "SetProcessDpiAwarenessContext"):
+                user32.SetProcessDpiAwarenessContext.argtypes = [ctypes.c_void_p]
+                user32.SetProcessDpiAwarenessContext.restype = ctypes.c_bool
+                if user32.SetProcessDpiAwarenessContext(
+                        ctypes.c_void_p(DPI_AWARENESS_PER_MONITOR_V2)):
+                    mode, done = "Per-Monitor V2", True
+                elif kernel32.GetLastError() == 5:   # ERROR_ACCESS_DENIED
+                    mode, done = "已由 exe 清单声明", True
+            if not done:
+                try:
+                    # shcore 返回 HRESULT，0 才是成功
+                    if ctypes.windll.shcore.SetProcessDpiAwareness(2) == 0:
+                        mode, done = "Per-Monitor", True
+                except Exception:
+                    pass
+            if not done:
+                try:
+                    user32.SetProcessDPIAware.restype = ctypes.c_bool
+                    if user32.SetProcessDPIAware():
+                        mode, done = "System", True
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    _DPI_STATE["mode"] = mode
+    return mode
+
+
+def window_dpi(hwnd=None):
+    """取窗口所在显示器的 DPI（每英寸像素数）。取不到按 96 处理。
+
+    注意：进程必须已经是 DPI 感知状态，否则这里只会拿到虚拟化的 96。
+    """
+    if os.name == "nt":
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            user32 = ctypes.windll.user32
+            if hwnd and hasattr(user32, "GetDpiForWindow"):
+                user32.GetDpiForWindow.argtypes = [wintypes.HWND]
+                user32.GetDpiForWindow.restype = ctypes.c_uint
+                dpi = int(user32.GetDpiForWindow(hwnd))
+                if dpi > 0:
+                    return dpi
+            if hasattr(user32, "GetDpiForSystem"):
+                user32.GetDpiForSystem.restype = ctypes.c_uint
+                dpi = int(user32.GetDpiForSystem())
+                if dpi > 0:
+                    return dpi
+            if hwnd:
+                user32.GetDC.argtypes = [wintypes.HWND]
+                user32.GetDC.restype = wintypes.HDC
+                user32.ReleaseDC.argtypes = [wintypes.HWND, wintypes.HDC]
+                hdc = user32.GetDC(hwnd)
+                if hdc:
+                    try:
+                        ctypes.windll.gdi32.GetDeviceCaps.restype = ctypes.c_int
+                        dpi = int(ctypes.windll.gdi32.GetDeviceCaps(hdc, 88))  # LOGPIXELSX
+                        if dpi > 0:
+                            return dpi
+                    finally:
+                        user32.ReleaseDC(hwnd, hdc)
+        except Exception:
+            pass
+    return int(BASE_DPI)
+
+
+def work_area(hwnd=None):
+    """返回窗口所在显示器的工作区 (left, top, right, bottom)，已排除任务栏。
+
+    单位是物理像素（进程 DPI 感知时）。
+    """
+    if os.name == "nt":
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            user32 = ctypes.windll.user32
+
+            class MONITORINFO(ctypes.Structure):
+                _fields_ = [("cbSize", wintypes.DWORD),
+                            ("rcMonitor", wintypes.RECT),
+                            ("rcWork", wintypes.RECT),
+                            ("dwFlags", wintypes.DWORD)]
+
+            monitor = None
+            if hwnd:
+                user32.MonitorFromWindow.argtypes = [wintypes.HWND, wintypes.DWORD]
+                user32.MonitorFromWindow.restype = wintypes.HANDLE
+                monitor = user32.MonitorFromWindow(hwnd, 2)  # MONITOR_DEFAULTTONEAREST
+            if monitor:
+                info = MONITORINFO()
+                info.cbSize = ctypes.sizeof(MONITORINFO)
+                user32.GetMonitorInfoW.argtypes = [wintypes.HANDLE,
+                                                   ctypes.POINTER(MONITORINFO)]
+                if user32.GetMonitorInfoW(monitor, ctypes.byref(info)):
+                    rect = info.rcWork
+                    return (rect.left, rect.top, rect.right, rect.bottom)
+        except Exception:
+            pass
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            rect = wintypes.RECT()
+            ctypes.windll.user32.SystemParametersInfoW(
+                0x0030, 0, ctypes.byref(rect), 0)   # SPI_GETWORKAREA
+            return (rect.left, rect.top, rect.right, rect.bottom)
+        except Exception:
+            pass
+    return (0, 0, 1920, 1080)
+
+
+def _parse_len(value):
+    """把 Tk 的尺寸取值解析成 int 或 (int, int)。"""
+    if isinstance(value, (tuple, list)):
+        parts = []
+        for item in value:
+            try:
+                parts.append(int(float(item)))
+            except (TypeError, ValueError):
+                return 0
+        if not parts:
+            return 0
+        return parts[0] if len(parts) == 1 else tuple(parts)
+    try:
+        return int(float(str(value).strip()))
+    except (TypeError, ValueError):
+        parts = []
+        for item in str(value).strip().split():
+            try:
+                parts.append(int(float(item)))
+            except ValueError:
+                return 0
+        if not parts:
+            return 0
+        return parts[0] if len(parts) == 1 else tuple(parts)
+
+
+def _scale_len(value, factor):
+    """按系数换算像素量。"""
+    if isinstance(value, tuple):
+        return tuple(max(0, int(round(v * factor))) for v in value)
+    return max(0, int(round(value * factor)))
+
+
+def _walk_widgets(widget):
+    """遍历控件树。"""
+    out = [widget]
+    for child in widget.winfo_children():
+        out.extend(_walk_widgets(child))
+    return out
+
+
+DEFAULT_FONT_NAMES = ("TkDefaultFont", "TkTextFont", "TkMenuFont",
+                      "TkHeadingFont", "TkCaptionFont", "TkSmallCaptionFont")
+
+
+def _font_spec_info(spec):
+    """从字体规格里取出 (字体名, 磅数)；取不到返回 None。
+
+    支持三种形态：
+      · ('Consolas', 9) 这样的元组；
+      · 'Consolas 9' 这样的字符串；
+      · ttk 控件 cget("font") 返回的 Font 对象。
+    以负数给出的就是像素尺寸（已经是最终值），返回 None 不再缩放。
+    """
+    if isinstance(spec, (tuple, list)):
+        parts = list(spec)
+        if len(parts) >= 2 and isinstance(parts[1], int):
+            return str(parts[0]), int(parts[1])
+        return None
+    if isinstance(spec, str):
+        text = spec.strip()
+        if not text or text.startswith("Tk"):
+            return None          # Tk 默认字体，单独处理
+        parts = text.split()
+        if len(parts) >= 2:
+            try:
+                return " ".join(parts[:-1]), int(parts[-1])
+            except ValueError:
+                return None
+        return None
+    # tkinter.font.Font 对象（ttk 控件就是这样返回的）
+    if hasattr(spec, "actual"):
+        name = str(getattr(spec, "name", "") or "")
+        if name.startswith("Tk"):
+            return None          # Tk 默认字体，单独处理
+        try:
+            size = spec.actual("size")
+            family = spec.actual("family")
+        except Exception:
+            return None
+        if isinstance(family, (tuple, list)):
+            family = family[0] if family else ""
+        if isinstance(size, int) and size > 0:
+            return str(family), int(size)
+    return None
+
+
+class DpiLayout:
+    """记录界面里所有以像素为单位的大小与字体，并按缩放系数重新换算。
+
+    字体这块有个坑：Tk 的 ``tk scaling`` 只在**新建**字体时才把“磅”换算成像素，
+    运行中改它并不会重排已经建好的控件。所以运行中要缩放（小屏自适应、
+    拖到缩放比例不同的显示器），必须自己把字体重设成像素尺寸。
+    """
+
+    GRID_OPTIONS = ("padx", "pady", "ipadx", "ipady")
+    WIDGET_OPTIONS = ("padding", "wraplength", "padx", "pady")
+
+    def __init__(self, root):
+        self.root = root
+        self.items = []          # (控件, 类别, 设计值)
+        self.elastic = []        # [控件, 当前行数, 设计行数, 最少行数]
+        self.fonts = []          # (控件, 字体名, 设计磅数, 设计像素数)
+        self.default_fonts = []  # (字体对象, 设计像素数)
+        self.factor = 1.0
+        self.base_factor = 1.0
+
+    def capture(self, base_factor=1.0):
+        """在还没缩放前，把所有像素量与字体记成“设计值”。"""
+        self.items = []
+        self.fonts = []
+        self.default_fonts = []
+        self.base_factor = base_factor or 1.0
+        scaling = 1.0
+        try:
+            scaling = float(self.root.tk.call("tk", "scaling"))
+        except Exception:
+            pass
+
+        # Tk 自带默认字体（ttk 控件用的就是它）
+        # 注意：不能用 tkfont.nametofont()——它绑定的是“默认根窗口”，
+        # 多窗口时可能作用到别的解释器上，这里直接用本窗口的解释器调用。
+        for name in DEFAULT_FONT_NAMES:
+            try:
+                size = self.root.tk.call("font", "configure", name, "-size")
+            except Exception:
+                continue
+            try:
+                points = int(str(size).strip())
+            except (TypeError, ValueError):
+                continue
+            if points <= 0:
+                continue
+            # 磅数换算成像素，再折算到 96 DPI 基准做一次合理性钳制：
+            # 个别环境里系统字体会被重复放大（同一进程里开第二个 Tk 时见过
+            # 默认字体变成 18 磅），不钳一下排版会整个撑大。
+            pixels = points * scaling
+            base_px = pixels / (base_factor or 1.0)
+            base_px = min(max(base_px, DEFAULT_FONT_PX[0]), DEFAULT_FONT_PX[1])
+            self.default_fonts.append((name, int(round(base_px * base_factor))))
+
+        for widget in _walk_widgets(self.root):
+            try:
+                info = widget.grid_info()
+            except Exception:
+                info = {}
+            for key in self.GRID_OPTIONS:
+                if key in info:
+                    self.items.append((widget, "grid:" + key, _parse_len(info[key])))
+            for key in self.WIDGET_OPTIONS:
+                try:
+                    value = widget.cget(key)
+                except Exception:
+                    continue          # 这个控件没有这个选项
+                if value in (None, "", 0):
+                    continue
+                self.items.append((widget, key, _parse_len(value)))
+            try:
+                spec = widget.cget("font")
+            except Exception:
+                continue
+            parsed = _font_spec_info(spec)
+            if parsed:
+                family, points = parsed
+                if points > 0:
+                    self.fonts.append((widget, family, points,
+                                       int(round(points * scaling))))
+        return self
+
+    def apply(self, factor):
+        """按系数重新换算并写回所有像素量与字体。"""
+        self.factor = factor
+        for widget, kind, design in self.items:
+            value = _scale_len(design, factor)
+            try:
+                if kind.startswith("grid:"):
+                    widget.grid_configure(**{kind.split(":", 1)[1]: value})
+                else:
+                    widget.configure(**{kind: value})
+            except Exception:
+                continue
+        self.apply_fonts(factor)
+
+    def apply_fonts(self, factor):
+        """按系数重设字体。
+
+        ``tk scaling`` 对已建好的字体无效，所以这里把字号换算成**像素**再写回去
+        （Tk 里负数字号就是像素），这样运行中缩放才能真正生效。
+        """
+        ratio = factor / (self.base_factor or 1.0)
+        for name, pixels in self.default_fonts:
+            try:
+                self.root.tk.call("font", "configure", name, "-size",
+                                  -max(MIN_FONT_PX, int(round(pixels * ratio))))
+            except Exception:
+                continue
+        for widget, family, _points, pixels in self.fonts:
+            try:
+                widget.configure(font=(family, -max(MIN_FONT_PX,
+                                                    int(round(pixels * ratio)))))
+            except Exception:
+                continue
+
+    def add_elastic(self, widget, rows, min_rows=4):
+        """登记一个“行数可压缩”的文本框：屏幕放不下时先少显示几行。"""
+        self.elastic.append([widget, rows, rows, min_rows])
+
+    def reset_rows(self):
+        """恢复文本框的设计行数（换到大屏时用）。"""
+        for item in self.elastic:
+            item[1] = item[2]
+            try:
+                item[0].configure(height=item[1])
+            except Exception:
+                continue
+
+    def shrink_rows(self):
+        """所有可压缩文本框各减一行；返回是否真的减了。"""
+        changed = False
+        for item in self.elastic:
+            widget, rows, design, min_rows = item
+            if rows > min_rows:
+                item[1] = rows - 1
+                try:
+                    widget.configure(height=item[1])
+                except Exception:
+                    continue
+                changed = True
+        return changed
+
+
+def fit_to_work_area(root, content, layout, factor, hwnd=None, min_factor=MIN_FACTOR):
+    """把界面调整到能放进当前显示器的工作区。
+
+    顺序：先压缩文本框行数（字号不变），再整体缩小（字号跟着缩）。
+    content 是内容容器（滚动容器里的那个 Frame），量的是它的请求尺寸。
+    返回 (最终系数, 内容宽, 内容高)。
+    """
+    left, top, right, bottom = work_area(hwnd)
+    avail_w = max(240, right - left)
+    avail_h = max(240, bottom - top)
+
+    def apply(f):
+        root.tk.call("tk", "scaling", f * BASE_DPI / 72.0)
+        layout.apply(f)
+
+    def measure():
+        root.update_idletasks()
+        return content.winfo_reqwidth(), content.winfo_reqheight()
+
+    layout.reset_rows()
+    apply(factor)
+    width, height = measure()
+
+    # 1) 先压行数：字号不变，只是少显示几行
+    while (width > avail_w or height > avail_h) and layout.shrink_rows():
+        width, height = measure()
+
+    # 2) 还放不下就整体缩小
+    while (width > avail_w or height > avail_h) and factor > min_factor:
+        factor = max(min_factor, round(factor - 0.04, 4))
+        apply(factor)
+        width, height = measure()
+
+    return factor, width, height
+
+
+# --------------------------------------------------------------------------------------
 # 图形界面
 # --------------------------------------------------------------------------------------
 
 def build_gui():
     import tkinter as tk
     from tkinter import ttk, messagebox, filedialog
+
+    # 必须在建窗口之前声明 DPI 感知，否则窗口会先被系统按位图拉伸一次
+    dpi_mode = enable_dpi_awareness()
 
     root = tk.Tk()
     root.title("IE 快捷方式创建工具")
@@ -1183,13 +1616,60 @@ def build_gui():
     except Exception:
         pass
 
+    # 窗口所在显示器的真实 DPI；字体按“磅”指定，会跟着 tk scaling 一起放大
+    hwnd = root.winfo_id()
+    state = {"path": "", "log": [], "dpi": window_dpi(hwnd),
+             "factor": 1.0, "dpi_pending": False, "mode": dpi_mode}
+    root.tk.call("tk", "scaling", state["dpi"] / 72.0)
+
     style = ttk.Style(root)
     try:
         style.theme_use("vista")
     except Exception:
         pass
 
-    state = {"path": "", "log": []}
+    # ---------- 低分辨率适配：内容放进可滚动容器 ----------
+    # 屏幕不够高 / 不够宽时，窗口会被压到工作区大小，
+    # 内容通过纵向滚动条访问，不会被裁掉。
+    outer = ttk.Frame(root)
+    outer.pack(fill="both", expand=True)
+    canvas = tk.Canvas(outer, borderwidth=0, highlightthickness=0,
+                       background=style.lookup("TFrame", "background") or "#f0f0f0")
+    vscroll = ttk.Scrollbar(outer, orient="vertical", command=canvas.yview)
+    hscroll = ttk.Scrollbar(outer, orient="horizontal", command=canvas.xview)
+    canvas.configure(yscrollcommand=vscroll.set, xscrollcommand=hscroll.set)
+    canvas.pack(side="left", fill="both", expand=True)
+    inner = ttk.Frame(canvas)
+    inner_id = canvas.create_window((0, 0), window=inner, anchor="nw")
+
+    def _on_inner_configure(_event):
+        canvas.configure(scrollregion=canvas.bbox("all"))
+
+    def _on_canvas_configure(event):
+        # 画布比内容宽时把内容拉满（少留白），比内容窄时靠横向滚动条兜底
+        if event.width > inner.winfo_reqwidth():
+            canvas.itemconfigure(inner_id, width=event.width)
+
+    def _on_wheel(event):
+        canvas.yview_scroll(-1 * (event.delta // 120), "units")
+
+    inner.bind("<Configure>", _on_inner_configure)
+    canvas.bind("<Configure>", _on_canvas_configure)
+    canvas.bind("<MouseWheel>", _on_wheel)
+    inner.bind("<MouseWheel>", _on_wheel)
+
+    # ---------- 紧凑模式：低分辨率下换更紧凑的布局 ----------
+    # 完整布局在 96 DPI 下约需 740×746；放不下就换成紧凑版
+    # （更窄的输入框、更少的环境信息行、单选按钮换行），
+    # 尽量不用滚动就能看完整个界面。
+    _wl, _wt, _wr, _wb = work_area(hwnd)
+    _factor0 = state["dpi"] / BASE_DPI
+    compact = ((_wr - _wl) < 780 * _factor0 or (_wb - _wt) < 770 * _factor0)
+    entry_cols = 34 if compact else 52
+    env_cols = 46 if compact else 68
+    log_cols = 50 if compact else 72
+    env_rows = 6 if compact else 10
+    log_rows = 6 if compact else 9
 
     def log(text, kind="info"):
         state["log"].append((kind, text))
@@ -1207,25 +1687,18 @@ def build_gui():
         status_var.set(text[:120])
 
     # ---------- 顶部：环境检测 ----------
-    env_frame = ttk.LabelFrame(root, text="  环境检测  ", padding=8)
+    env_frame = ttk.LabelFrame(inner, text="  环境检测  ", padding=8)
     env_frame.grid(row=0, column=0, columnspan=2, sticky="ew", padx=10, pady=(10, 6))
     env_scroll = ttk.Scrollbar(env_frame, orient="vertical")
     env_scroll.grid(row=0, column=1, sticky="ns")
-    env_text = tk.Text(env_frame, height=10, width=68, relief="flat", wrap="word",
-                       bg="#f5f5f5", font=("Consolas", 9))
+    env_text = tk.Text(env_frame, height=env_rows, width=env_cols, relief="flat",
+                       wrap="word", bg="#f5f5f5", font=("Consolas", 9))
     env_text.grid(row=0, column=0, sticky="ew")
     env_text.configure(yscrollcommand=env_scroll.set)
 
-    def show_env():
-        info = detect_all()
-        lines = [
-            "操作系统      : %s" % info["os"],
-            "IE 程序       : %s" % (info["ie_path"] if info["ie_exists"]
-                                    else "未找到 iexplore.exe"),
-            "Edge 程序     : %s" % (info["edge_path"] if info["edge_exists"]
-                                    else "未找到 msedge.exe"),
-            "桌面目录      : %s" % info["desktop"],
-            "开始菜单目录  : %s" % info["startmenu"],
+    def env_detail_text():
+        """环境面板的“详细说明”部分（紧凑模式下收进按钮里）。"""
+        return [
             "",
             "关键点        : 参数中的 -Embedding 会让 iexplore.exe 打开真正的 IE 窗口"
             "（窗口类 IEFrame）；",
@@ -1233,22 +1706,50 @@ def build_gui():
             "系统现状      : Windows 11 已移除 IE 桌面程序，只能用 Edge 的 IE 模式；",
             "                Windows 10 上 IE11 组件仍在时可用本方案。",
         ]
+
+    def show_env():
+        info = detect_all()
+        factor = state.get("factor") or 1.0
+        lines = [
+            "操作系统      : %s" % info["os"],
+            "显示缩放      : %d%%（%d DPI，%s）"
+            % (int(round(factor * 100)), state.get("dpi", 96), state.get("mode", "")),
+            "IE 程序       : %s" % (info["ie_path"] if info["ie_exists"]
+                                    else "未找到 iexplore.exe"),
+            "Edge 程序     : %s" % (info["edge_path"] if info["edge_exists"]
+                                    else "未找到 msedge.exe"),
+            "桌面目录      : %s" % info["desktop"],
+            "开始菜单目录  : %s" % info["startmenu"],
+        ]
+        if not compact:
+            lines += env_detail_text()
         env_text.configure(state="normal")
         env_text.delete("1.0", "end")
         env_text.insert("1.0", "\n".join(lines))
         env_text.configure(state="disabled")
 
-    ttk.Button(env_frame, text="重新检测", command=show_env).grid(
-        row=1, column=0, sticky="w", pady=(6, 0))
-    ttk.Button(env_frame, text="打开 Edge 的 IE 模式设置",
-               command=lambda: open_url("edge://settings/defaultBrowser")).grid(
-        row=1, column=1, sticky="w", pady=(6, 0))
-    ttk.Button(env_frame, text="打开 IE 模式诊断页",
-               command=lambda: open_url("edge://compat/iediagnostic")).grid(
-        row=1, column=2, sticky="w", pady=(6, 0))
+    def show_env_detail():
+        messagebox.showinfo("环境说明", "\n".join(env_detail_text()).strip())
+
+    _env_buttons = [
+        ("重新检测", show_env),
+        ("打开 Edge 的 IE 模式设置", lambda: open_url("edge://settings/defaultBrowser")),
+        ("打开 IE 模式诊断页", lambda: open_url("edge://compat/iediagnostic")),
+    ]
+    if compact:
+        # 低分辨率：按钮改成两列两行，别把环境框撑得太宽
+        _env_buttons.insert(1, ("查看说明", show_env_detail))
+        for _i, (_txt, _cmd) in enumerate(_env_buttons):
+            _row, _col = divmod(_i, 2)
+            ttk.Button(env_frame, text=_txt, command=_cmd).grid(
+                row=1 + _row, column=_col, sticky="w", padx=(0, 8), pady=(6, 0))
+    else:
+        for _i, (_txt, _cmd) in enumerate(_env_buttons):
+            ttk.Button(env_frame, text=_txt, command=_cmd).grid(
+                row=1, column=_i, sticky="w", pady=(6, 0))
 
     # ---------- 设置区 ----------
-    form = ttk.LabelFrame(root, text="  快捷方式设置  ", padding=8)
+    form = ttk.LabelFrame(inner, text="  快捷方式设置  ", padding=8)
     form.grid(row=1, column=0, columnspan=2, sticky="ew", padx=10)
 
     var_target = tk.StringVar(value=DEFAULT_TARGET)
@@ -1260,7 +1761,7 @@ def build_gui():
     var_icon = tk.StringVar(value="system")
 
     ttk.Label(form, text="目标程序：").grid(row=0, column=0, sticky="w", pady=2)
-    ttk.Entry(form, textvariable=var_target, width=52).grid(row=0, column=1, sticky="ew", pady=2)
+    ttk.Entry(form, textvariable=var_target, width=entry_cols).grid(row=0, column=1, sticky="ew", pady=2)
     ttk.Button(form, text="浏览…", width=8,
                command=lambda: _pick_file(var_target)).grid(row=0, column=2, padx=(6, 0))
     ie_switch_btn = ttk.Button(form, text="用 32 位 IE", width=12,
@@ -1280,27 +1781,32 @@ def build_gui():
     _update_ie_switch_label()
 
     ttk.Label(form, text="启动参数：").grid(row=1, column=0, sticky="w", pady=2)
-    ttk.Entry(form, textvariable=var_args, width=52).grid(row=1, column=1, sticky="ew", pady=2)
+    ttk.Entry(form, textvariable=var_args, width=entry_cols).grid(row=1, column=1, sticky="ew", pady=2)
 
     ttk.Label(form, text="快捷方式名：").grid(row=2, column=0, sticky="w", pady=2)
-    ttk.Entry(form, textvariable=var_name, width=52).grid(row=2, column=1, sticky="ew", pady=2)
+    ttk.Entry(form, textvariable=var_name, width=entry_cols).grid(row=2, column=1, sticky="ew", pady=2)
 
     ttk.Label(form, text="描述：").grid(row=3, column=0, sticky="w", pady=2)
-    ttk.Entry(form, textvariable=var_desc, width=52).grid(row=3, column=1, sticky="ew", pady=2)
+    ttk.Entry(form, textvariable=var_desc, width=entry_cols).grid(row=3, column=1, sticky="ew", pady=2)
 
     ttk.Label(form, text="创建位置：").grid(row=4, column=0, sticky="w", pady=2)
     loc_box = ttk.Frame(form)
     loc_box.grid(row=4, column=1, sticky="w")
-    ttk.Radiobutton(loc_box, text="桌面", value="desktop",
-                    variable=var_loc).grid(row=0, column=0, padx=(0, 10))
-    ttk.Radiobutton(loc_box, text="开始菜单", value="startmenu",
-                    variable=var_loc).grid(row=0, column=1, padx=(0, 10))
-    ttk.Radiobutton(loc_box, text="所有用户桌面", value="publicdesktop",
-                    variable=var_loc).grid(row=0, column=2, padx=(0, 10))
-    ttk.Radiobutton(loc_box, text="所有用户开始菜单", value="allusersstartmenu",
-                    variable=var_loc).grid(row=0, column=3, padx=(0, 10))
-    ttk.Radiobutton(loc_box, text="自定义目录", value="custom",
-                    variable=var_loc).grid(row=0, column=4)
+    _loc_items = [("桌面", "desktop"), ("开始菜单", "startmenu"),
+                  ("所有用户桌面", "publicdesktop"),
+                  ("所有用户开始菜单", "allusersstartmenu"),
+                  ("自定义目录", "custom")]
+    for _i, (_txt, _val) in enumerate(_loc_items):
+        if compact:
+            # 低分辨率：一行放不下就换成三列两行
+            _row, _col = divmod(_i, 3)
+            ttk.Radiobutton(loc_box, text=_txt, value=_val,
+                            variable=var_loc).grid(row=_row, column=_col,
+                                                   padx=(0, 10), pady=(0, 2),
+                                                   sticky="w")
+        else:
+            ttk.Radiobutton(loc_box, text=_txt, value=_val,
+                            variable=var_loc).grid(row=0, column=_i, padx=(0, 10))
     custom_entry = ttk.Entry(form, textvariable=var_custom, width=30)
     custom_entry.grid(row=5, column=1, sticky="w", pady=2)
     pick_dir_btn = ttk.Button(form, text="选择目录…", width=10,
@@ -1310,15 +1816,21 @@ def build_gui():
     ttk.Label(form, text="图标：").grid(row=6, column=0, sticky="w", pady=2)
     icon_box = ttk.Frame(form)
     icon_box.grid(row=6, column=1, sticky="w")
-    ttk.Radiobutton(icon_box, text="使用 IE 程序自带图标", value="system",
-                    variable=var_icon).grid(row=0, column=0, padx=(0, 10))
-    ttk.Radiobutton(icon_box, text="使用工具内置 IE 图标", value="bundled",
-                    variable=var_icon).grid(row=0, column=1)
+    if compact:
+        ttk.Radiobutton(icon_box, text="使用 IE 程序自带图标", value="system",
+                        variable=var_icon).grid(row=0, column=0, padx=(0, 10))
+        ttk.Radiobutton(icon_box, text="使用工具内置 IE 图标", value="bundled",
+                        variable=var_icon).grid(row=1, column=0, sticky="w")
+    else:
+        ttk.Radiobutton(icon_box, text="使用 IE 程序自带图标", value="system",
+                        variable=var_icon).grid(row=0, column=0, padx=(0, 10))
+        ttk.Radiobutton(icon_box, text="使用工具内置 IE 图标", value="bundled",
+                        variable=var_icon).grid(row=0, column=1)
 
     form.columnconfigure(1, weight=1)
 
     # ---------- 实际生效预览（完全对应界面上的参数） ----------
-    preview_frame = ttk.LabelFrame(root, text="  实际生效的命令  ", padding=8)
+    preview_frame = ttk.LabelFrame(inner, text="  实际生效的命令  ", padding=8)
     preview_frame.grid(row=2, column=0, columnspan=2, sticky="ew", padx=10, pady=(8, 0))
     preview_var = tk.StringVar(value="")
     ttk.Label(preview_frame, textvariable=preview_var, font=("Consolas", 9),
@@ -1373,7 +1885,7 @@ def build_gui():
     var_loc.trace_add("write", _update_preview)
 
     # ---------- 操作区 ----------
-    act = ttk.Frame(root)
+    act = ttk.Frame(inner)
     act.grid(row=3, column=0, columnspan=2, sticky="ew", padx=10, pady=8)
 
     def _do_create(settings):
@@ -1581,17 +2093,17 @@ def build_gui():
                command=do_open_dir).grid(row=0, column=3, padx=3)
 
     # ---------- 日志 ----------
-    log_frame = ttk.LabelFrame(root, text="  运行日志  ", padding=6)
+    log_frame = ttk.LabelFrame(inner, text="  运行日志  ", padding=6)
     log_frame.grid(row=4, column=0, columnspan=2, sticky="ew", padx=10, pady=(0, 10))
     scroll = ttk.Scrollbar(log_frame, orient="vertical")
-    log_box = tk.Text(log_frame, height=9, width=72, wrap="word",
+    log_box = tk.Text(log_frame, height=log_rows, width=log_cols, wrap="word",
                       font=("Consolas", 9), state="disabled")
     log_box.pack(side="left", fill="both", expand=True)
     scroll.pack(side="right", fill="y")
     log_box.configure(yscrollcommand=scroll.set)
 
     status_var = tk.StringVar(value="就绪")
-    ttk.Label(root, textvariable=status_var, anchor="w",
+    ttk.Label(inner, textvariable=status_var, anchor="w",
               relief="sunken").grid(row=5, column=0, columnspan=2,
                                     sticky="ew", padx=10, pady=(0, 8))
 
@@ -1627,9 +2139,87 @@ def build_gui():
         except Exception as exc:
             log("打开失败：%s" % exc, "err")
 
+    # ---------- DPI 适配：按真实 DPI 排版，并保证整窗落在工作区内 ----------
+    layout = DpiLayout(inner)
+    layout.capture(state["dpi"] / BASE_DPI)  # 记下“96 DPI 设计值”，后面按系数换算
+    layout.add_elastic(env_text, env_rows, 4)   # 环境框：空间不够时先减行数
+    layout.add_elastic(log_box, log_rows, 4)    # 日志框：同理
+
+    def _relayout(dpi, center=False):
+        """按指定 DPI 重新排版，并把窗口摆到工作区里。
+
+        内容比工作区还大时，窗口压到工作区大小，多出来的部分用滚动条访问，
+        不会被裁掉。
+        """
+        factor, need_w, need_h = fit_to_work_area(root, inner, layout,
+                                                  dpi / BASE_DPI, hwnd)
+        state["dpi"] = dpi
+        state["factor"] = factor
+        left, top, right, bottom = work_area(hwnd)
+        avail_w = max(240, right - left)
+        avail_h = max(240, bottom - top)
+        win_w = min(need_w, avail_w)
+        win_h = min(need_h, avail_h)
+
+        # 滚动条按需出现，并从可用空间里扣掉
+        need_v = need_h > win_h
+        need_hbar = need_w > win_w
+        vscroll.pack_forget()
+        hscroll.pack_forget()
+        if need_v:
+            vscroll.pack(side="right", fill="y")
+        if need_hbar:
+            hscroll.pack(side="bottom", fill="x")
+        canvas.configure(width=max(1, win_w - (vscroll.winfo_reqwidth() if need_v else 0)),
+                         height=max(1, win_h - (hscroll.winfo_reqheight() if need_hbar else 0)))
+
+        if center:
+            x = left + max(0, (avail_w - win_w) // 2)
+            y = top + max(0, (avail_h - win_h) // 2)
+        else:
+            # 拖到别的显示器后，把窗口拉回工作区里，但不动用户摆的位置
+            x = min(max(root.winfo_x(), left), max(left, right - win_w))
+            y = min(max(root.winfo_y(), top), max(top, bottom - win_h))
+        root.geometry("%dx%d+%d+%d" % (win_w, win_h, x, y))
+        return factor
+
+    def _watch_dpi():
+        """窗口被拖到缩放比例不同的显示器时，按新 DPI 重新排版。"""
+        try:
+            new_dpi = window_dpi(root.winfo_id())
+        except Exception:
+            return
+        if abs(new_dpi - state["dpi"]) < 2:
+            return
+        _relayout(new_dpi)
+        log("显示缩放变为 %d%%（%d DPI），已重新排版"
+            % (int(round(new_dpi / BASE_DPI * 100)), new_dpi), "info")
+
+    def _schedule_dpi_check():
+        """<Configure> 在移动窗口时很频繁，这里做个去抖。"""
+        if state.get("dpi_pending"):
+            return
+        state["dpi_pending"] = True
+
+        def run():
+            state["dpi_pending"] = False
+            _watch_dpi()
+
+        root.after(200, run)
+
+    root.bind("<Configure>", lambda _event: _schedule_dpi_check())
+
+    _relayout(state["dpi"], center=True)
+
     show_env()
     _update_preview()
     log("工具就绪。默认命令：\"%s\" %s" % (DEFAULT_TARGET, DEFAULT_ARGS))
+
+    # 环境面板的文本是内容驱动的（文本超出 -height 后请求高度会变），
+    # 所以内容填好之后要重量一次，窗口尺寸才和实际内容对得上。
+    _relayout(state["dpi"], center=True)
+    show_env()
+
     root.mainloop()
 
 
@@ -1823,6 +2413,9 @@ def main(argv=None):
     if any(a in ("-h", "--help", "/?") for a in argv):
         print(__doc__)
         return 0
+
+    # 先声明 DPI 感知：命令行模式弹的提示框也要跟着系统缩放清晰显示
+    enable_dpi_awareness()
 
     parser = argparse.ArgumentParser(add_help=False, description="IE 快捷方式创建工具")
     parser.add_argument("--create", action="store_true", help="命令行创建快捷方式")

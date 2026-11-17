@@ -1,0 +1,3 @@
+# Intentionally tracked: this virtual environment is committed to the repository.
+# The original "*" ignore rule was removed so that new packages installed into
+# .venv are picked up by `git add .venv` instead of being silently skipped.

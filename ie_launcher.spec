@@ -43,4 +43,7 @@ exe = EXE(
     codesign_identity=None,
     entitlements_file=None,
     icon=['ie_icon.ico'],
+    # 自定义清单：声明 Per-Monitor V2 的 DPI 感知
+    # （不加的话 exe 默认是 DPI-unaware，Windows 会把窗口按位图拉伸，文字发虚）
+    manifest='ie_launcher.manifest',
 )
